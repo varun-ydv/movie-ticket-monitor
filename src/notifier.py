@@ -1,8 +1,20 @@
 """Telegram notification sender."""
 
 import json
+from urllib.parse import urlparse
 import requests
 from src.config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+
+
+def _validate_url(url: str) -> str:
+    """Ensure URL has https scheme and a valid network location. Returns safe URL or cinema homepage."""
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme in ("http", "https") and parsed.netloc:
+            return url
+    except Exception:
+        pass
+    return ""  # Will be handled by caller
 
 
 def send_telegram(text: str, parse_mode: str = "Markdown", reply_markup: dict | None = None):
@@ -35,36 +47,43 @@ def send_telegram(text: str, parse_mode: str = "Markdown", reply_markup: dict | 
 
 def notify_tickets_live(cinema_name: str, movie_title: str, release: str, booking_url: str):
     """Send a TICKETS LIVE alert — the urgent notification."""
+    safe_url = _validate_url(booking_url)
 
     text = (
         f"🎫 *TICKETS LIVE: {movie_title}*\n"
         f"📍 {cinema_name}\n"
-        f"📅 Release: {release}\n"
-        f"🔗 [Book Now]({booking_url})"
+        f"📅 Release: {release}"
     )
+    if safe_url:
+        text += f"\n🔗 [Book Now]({safe_url})"
 
     # Inline keyboard with direct booking link
-    reply_markup = {
-        "inline_keyboard": [
-            [{"text": "🎟️ Book Tickets Now", "url": booking_url}]
-        ]
-    }
-
-    send_telegram(text, reply_markup=reply_markup)
+    if safe_url:
+        reply_markup = {
+            "inline_keyboard": [
+                [{"text": "🎟️ Book Tickets Now", "url": safe_url}]
+            ]
+        }
+        send_telegram(text, reply_markup=reply_markup)
+    else:
+        send_telegram(text)
 
 
 def notify_coming_soon(cinema_name: str, movie_title: str, release: str, page_url: str):
     """Send a COMING SOON notification — lower urgency."""
+    safe_url = _validate_url(page_url)
     text = (
         f"📋 *Coming Soon: {movie_title}*\n"
         f"📍 {cinema_name}\n"
-        f"📅 Release: {release}\n"
-        f"🔗 [View]({page_url})"
+        f"📅 Release: {release}"
     )
+    if safe_url:
+        text += f"\n🔗 [View]({safe_url})"
     send_telegram(text)
 
 
 def notify_error(cinema_name: str, error: str):
-    """Send an error alert so you know a scraper is broken."""
-    text = f"⚠️ *Scraper Error: {cinema_name}*\n`{error}`"
+    """Send an error alert so you know a scraper is broken. Sanitized for Telegram."""
+    # Only send a generic message — full error details stay in logs
+    text = f"⚠️ *Scraper Error: {cinema_name}*\nCheck GitHub Actions logs for details."
     send_telegram(text)

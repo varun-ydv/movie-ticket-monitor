@@ -1,7 +1,9 @@
 """Event Cinemas scraper (Sydney IMAX).
 
-Event Cinemas is the hardest site — heavily JS-dependent with a cinema
-selector. We need to select the right cinema and wait for content to load.
+Event Cinemas renders movies as text elements (not links) in a structured
+pattern: "ON SALE" marker, movie title, date, "Times & Tickets" / "More Info".
+After clicking "IMAX Sydney", movies load via JavaScript.
+We parse the page text to extract this structured data.
 """
 
 from playwright.async_api import Page
@@ -19,38 +21,30 @@ class EventScraper(BaseScraper):
         await page.goto(self.config["coming_soon_url"], wait_until="domcontentloaded", timeout=30000)
         await page.wait_for_timeout(3000)
 
-        # Try to select Sydney IMAX cinema if a selector exists
-        await self._select_cinema(page)
+        # Select IMAX Sydney
+        await self._select_imax_sydney(page)
+        await page.wait_for_timeout(5000)  # Extra time for data load
 
-        # Wait for movie content to load after cinema selection
-        await page.wait_for_timeout(3000)
-
-        # Extract movie listings
-        results.extend(await self._extract_movies(page, "coming_soon"))
+        results.extend(await self._parse_movie_list(page))
 
         # --- Now Showing page ---
-        await page.goto(self.config["now_showing_url"], wait_until="domcontentloaded", timeout=30000)
-        await page.wait_for_timeout(3000)
+        try:
+            await page.goto(self.config["now_showing_url"], wait_until="domcontentloaded", timeout=30000)
+            await page.wait_for_timeout(3000)
+            await self._select_imax_sydney(page)
+            await page.wait_for_timeout(5000)
 
-        await self._select_cinema(page)
-        await page.wait_for_timeout(3000)
+            listings = await self._parse_movie_list(page)
+            # If found on Now Showing, mark as tickets_available
+            for l in listings:
+                l.status = "tickets_available"
+            results.extend(listings)
+        except Exception as e:
+            print(f"[event] Error scraping now showing: {e}")
 
-        results.extend(await self._extract_movies(page, "tickets_available"))
-
-        # Deduplicate by title
-        seen_titles = set()
-        deduped = []
-        for r in results:
-            key = r.title.lower().strip()
-            if key not in seen_titles:
-                seen_titles.add(key)
-                # If we have a coming_soon and tickets_available for the same movie,
-                # keep the tickets_available one
-                deduped.append(r)
-
-        # Now do a second pass to prefer tickets_available over coming_soon
+        # Deduplicate: prefer tickets_available over coming_soon
         final = {}
-        for r in deduped:
+        for r in results:
             key = r.title.lower().strip()
             if key not in final or r.status == "tickets_available":
                 final[key] = r
@@ -58,103 +52,77 @@ class EventScraper(BaseScraper):
         print(f"[event] Found {len(final)} unique listings")
         return list(final.values())
 
-    async def _select_cinema(self, page: Page):
-        """Try to select Sydney IMAX from cinema dropdown/selector."""
-        # Try common dropdown selectors
-        selectors = [
-            "select[name*='cinema']",
-            "select[id*='cinema']",
-            "[class*='cinema-selector']",
-            "[class*='CinemaSelector']",
-            "button[class*='cinema']",
-        ]
+    async def _select_imax_sydney(self, page: Page) -> bool:
+        """Click IMAX Sydney in the cinema selector via JS click."""
+        try:
+            clicked = await page.evaluate('''() => {
+                const labels = document.querySelectorAll('label, span, div, a');
+                for (const el of labels) {
+                    if (el.textContent.trim() === 'IMAX Sydney') {
+                        el.click();
+                        return true;
+                    }
+                }
+                return false;
+            }''')
+            if clicked:
+                print("[event] Selected IMAX Sydney cinema")
+            return clicked
+        except Exception as e:
+            print(f"[event] Cinema selection error: {e}")
+            return False
 
-        for selector in selectors:
-            el = await page.query_selector(selector)
-            if el:
-                try:
-                    tag = await el.evaluate("el => el.tagName.toLowerCase()")
-                    if tag == "select":
-                        # Try to find Sydney IMAX option
-                        options = await el.query_selector_all("option")
-                        for opt in options:
-                            text = (await opt.inner_text()).strip().lower()
-                            if "imax" in text or "sydney" in text:
-                                value = await opt.get_attribute("value")
-                                if value:
-                                    await el.select_option(value)
-                                    print(f"[event] Selected cinema option: {text}")
-                                    return
-                    else:
-                        # Click-based selector
-                        await el.click()
-                        await page.wait_for_timeout(1000)
-                        # Look for Sydney IMAX in the dropdown
-                        imax_option = await page.query_selector("text=/sydney.*imax/i")
-                        if imax_option:
-                            await imax_option.click()
-                            print(f"[event] Selected Sydney IMAX from dropdown")
-                            return
-                except Exception as e:
-                    print(f"[event] Cinema selection attempt failed: {e}")
-                    continue
+    async def _parse_movie_list(self, page: Page) -> list[MovieListing]:
+        """Extract movie listings with real URLs from Event Cinemas.
 
-        print("[event] Could not find cinema selector, proceeding with default")
+        Uses JavaScript to find <a href="/Movie/..."> links which have the
+        actual movie slugs. Determines status from whether "Times & Tickets"
+        text appears near the movie card.
+        """
+        raw = await page.evaluate('''() => {
+            const movies = {};
+            const links = document.querySelectorAll('a[href^="/Movie/"]');
+            links.forEach(a => {
+                const href = a.getAttribute('href');
+                // Get the raw text and split into lines
+                const lines = a.textContent.split(/\\n/).map(l => l.trim()).filter(l => l.length > 0);
 
-    async def _extract_movies(self, page: Page, default_status: str) -> list[MovieListing]:
-        """Extract movie listings from the current page."""
+                // Find the movie title line: not a date, not "ON SALE", not "Trailer", not "More Info"
+                let title = '';
+                for (const line of lines) {
+                    if (line.length >= 3 && line.length <= 60 &&
+                        !/^(ON SALE|Times|More Info|Trailer|\\d{1,2}\\s)/.test(line)) {
+                        title = line;
+                        break;
+                    }
+                }
+                if (!title) return;
+
+                // Strip any remaining noise: "CTC" rating, dates, "Trailer"
+                title = title.replace(/\\s*CTC\\s*/g, ' ').trim();
+
+                // Check if the parent card has "Times & Tickets" (means tickets are on sale)
+                const card = a.closest('[class*="movie"]') || a.parentElement?.parentElement;
+                const cardText = card ? card.textContent.toLowerCase() : '';
+                const status = cardText.includes('times & tickets') ? 'tickets_available' : 'coming_soon';
+
+                // Deduplicate by href
+                if (!movies[href]) {
+                    movies[href] = { title, status, href };
+                }
+            });
+            return Object.values(movies);
+        }''')
+
         results = []
+        for m in raw:
+            url = "https://www.eventcinemas.com.au" + m["href"]
+            results.append(MovieListing(
+                title=m["title"],
+                status=m["status"],
+                url=url,
+                cinema_id=self.cinema_id,
+            ))
 
-        # Try multiple selectors
-        selectors_to_try = [
-            "a[href*='/Movies/']",
-            "article a",
-            ".movie-card a",
-            ".movie-item a",
-            "[class*='movie'] a",
-            "[class*='Movie'] a",
-            ".movie-list a",
-        ]
-
-        links = []
-        for selector in selectors_to_try:
-            found = await page.query_selector_all(selector)
-            if found:
-                links = found
-                print(f"[event] Found {len(found)} links with selector: {selector}")
-                break
-
-        if not links:
-            print("[event] No movie links found on page")
-            return results
-
-        for link in links:
-            try:
-                text = (await link.inner_text()).strip()
-                href = await link.get_attribute("href") or ""
-
-                # Get the movie title — usually the first meaningful line
-                title = text.split("\n")[0].strip()
-                if not title or len(title) < 3:
-                    continue
-
-                if href.startswith("/"):
-                    href = "https://www.eventcinemas.com.au" + href
-
-                # Check for ticket availability indicators
-                status = default_status
-                card_text = text.lower()
-                if any(kw in card_text for kw in ["buy tickets", "book now", "session times", "tickets available"]):
-                    status = "tickets_available"
-
-                results.append(MovieListing(
-                    title=title,
-                    status=status,
-                    url=href or self.config["coming_soon_url"],
-                    cinema_id=self.cinema_id,
-                ))
-            except Exception as e:
-                print(f"[event] Error extracting movie from link: {e}")
-                continue
-
+        print(f"[event] Extracted {len(results)} movies with real URLs")
         return results
