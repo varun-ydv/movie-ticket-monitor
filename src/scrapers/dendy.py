@@ -78,7 +78,15 @@ class DendyScraper(BaseScraper):
 
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=15000)
-            await page.wait_for_timeout(3000)
+
+            # Wait for session buttons to actually render (Quasar is slow)
+            try:
+                await page.wait_for_selector(".q-btn", timeout=10000)
+            except Exception:
+                print(f"[dendy] No buttons found on /movie/{slug}")
+                return False
+
+            await page.wait_for_timeout(2000)
 
             # Look for session time buttons (format: "3:20 PMEnds at 6:01 PM")
             has_sessions = await page.evaluate(r'''() => {
