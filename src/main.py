@@ -84,15 +84,12 @@ async def main():
                     notify_tickets_live(
                         cinema_name=cinema_name,
                         movie_title=movie["title"],
-                        release=movie["release"],
                         booking_url=listing.url,
                     )
                 else:
                     notify_coming_soon(
                         cinema_name=cinema_name,
                         movie_title=movie["title"],
-                        release=movie["release"],
-                        page_url=listing.url,
                     )
                 notifications_sent += 1
             else:
