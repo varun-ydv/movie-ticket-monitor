@@ -64,7 +64,9 @@ class DendyScraper(BaseScraper):
             MovieListing(
                 title=title,
                 status="coming_soon",
-                url=f"https://canberra.dendy.com.au/movie/{self._slugify(title)}",
+                # Dendy is a Quasar SPA — /movie/{slug} URLs only work in headless browsers.
+                # Link to the home page where users can see session times and book.
+                url="https://canberra.dendy.com.au/home-page/",
                 cinema_id=self.cinema_id,
             )
             for title in raw
